@@ -32,7 +32,7 @@ struct Word {
 async fn main() -> Result<(), anyhow::Error> {
     const COLLECTION_NAME: &str = "rig-collection";
 
-    let client = Qdrant::from_url("http://localhost:6334").build()?;
+    let client: Qdrant = Qdrant::from_url("http://localhost:6334").build()?;
 
     // Create a collection with 1536 dimensions if it doesn't exist
     // Note: Make sure the dimensions match the size of the embeddings returned by the

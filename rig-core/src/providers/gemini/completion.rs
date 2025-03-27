@@ -15,9 +15,10 @@ pub const GEMINI_1_5_PRO_8B: &str = "gemini-1.5-pro-8b";
 pub const GEMINI_1_0_PRO: &str = "gemini-1.0-pro";
 
 use gemini_api_types::{
-    Content, FunctionDeclaration, GenerateContentRequest, GenerateContentResponse,
-    GenerationConfig, Part, Role, Tool,
+    Content, ContentCandidate, FunctionDeclaration, GenerateContentRequest,
+    GenerateContentResponse, GenerationConfig, Part, Role, Tool,
 };
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::convert::TryFrom;
 
@@ -31,6 +32,20 @@ use super::Client;
 // =================================================================
 // Rig Implementation Types
 // =================================================================
+//
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiErrorResponse {
+    pub error: GeminiError,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GeminiError {
+    pub code: i32,
+    pub message: String,
+    pub status: String,
+    pub details: Option<Vec<serde_json::Value>>,
+}
 
 #[derive(Clone)]
 pub struct CompletionModel {
@@ -70,23 +85,93 @@ impl completion::CompletionModel for CompletionModel {
             .await?;
 
         if response.status().is_success() {
-            let response = response.json::<GenerateContentResponse>().await?;
-            match response.usage_metadata {
-                Some(ref usage) => tracing::info!(target: "rig",
-                "Gemini completion token usage: {}",
-                usage
-                ),
-                None => tracing::info!(target: "rig",
-                    "Gemini completion token usage: n/a",
-                ),
+            let response_text = response.text().await?;
+
+            // Try to parse as the normal response format
+            let response_result: Result<GenerateContentResponse, _> =
+                serde_json::from_str(&response_text);
+
+            match response_result {
+                Ok(response) => {
+                    match response.usage_metadata {
+                        Some(ref usage) => tracing::info!(target: "rig",
+                            "Gemini completion token usage: {}",
+                            usage
+                        ),
+                        None => tracing::info!(target: "rig",
+                            "Gemini completion token usage: n/a",
+                        ),
+                    }
+
+                    tracing::debug!("Received response");
+
+                    Ok(completion::CompletionResponse::try_from(response)?)
+                }
+                Err(e) => {
+                    // If parsing as standard response failed, try parsing as minimal response (thinking models)
+                    tracing::warn!("Failed to parse standard response: {}", e);
+                    tracing::debug!("Response content: {}", response_text);
+
+                    // Try to extract just the content text if it's a minimal response
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response_text) {
+                        // Create a synthetic response with the content
+                        if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
+                            let synthetic_response = GenerateContentResponse {
+                                candidates: vec![ContentCandidate {
+                                    content: Content {
+                                        parts: OneOrMany::one(Part::Text(text.to_string())),
+                                        role: Some(Role::Model),
+                                    },
+                                    finish_reason: None,
+                                    safety_ratings: None,
+                                    citation_metadata: None,
+                                    token_count: None,
+                                    avg_logprobs: None,
+                                    logprobs_result: None,
+                                    index: None,
+                                }],
+                                prompt_feedback: None,
+                                usage_metadata: None,
+                                model_version: None,
+                            };
+
+                            return Ok(completion::CompletionResponse::try_from(
+                                synthetic_response,
+                            )?);
+                        }
+
+                        if json.get("usageMetadata").is_some()
+                            && json.get("modelVersion").is_some()
+                            && !json.get("candidates").is_some()
+                        {
+                            // This is a response with metadata but no content - likely a rate limit or error condition
+                            return Err(CompletionError::ProviderError(format!(
+                                    "Gemini API returned metadata without content. This might be due to rate limiting or input filtering. Response: {}",
+                                    response_text
+                                )));
+                        }
+
+                        // Try to parse as an error response
+                        if let Ok(error_response) =
+                            serde_json::from_value::<GeminiErrorResponse>(json.clone())
+                        {
+                            return Err(CompletionError::ProviderError(format!(
+                                "Gemini API error: {} (code: {})",
+                                error_response.error.message, error_response.error.code
+                            )));
+                        }
+                    }
+
+                    // If all parsing attempts failed, return a generic error with the response content
+                    Err(CompletionError::ResponseError(format!(
+                        "Failed to parse Gemini response: {}\nRaw response: {}",
+                        e, response_text
+                    )))
+                }
             }
-
-            tracing::debug!("Received response");
-
-            Ok(completion::CompletionResponse::try_from(response))
         } else {
             Err(CompletionError::ProviderError(response.text().await?))
-        }?
+        }
     }
 }
 
@@ -607,7 +692,7 @@ pub mod gemini_api_types {
         pub prompt_token_count: i32,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub cached_content_token_count: Option<i32>,
-        pub candidates_token_count: i32,
+        pub candidates_token_count: Option<i32>,
         pub total_token_count: i32,
     }
 
@@ -621,7 +706,10 @@ pub mod gemini_api_types {
                     Some(count) => count.to_string(),
                     None => "n/a".to_string(),
                 },
-                self.candidates_token_count,
+                match self.candidates_token_count {
+                    Some(count) => count.to_string(),
+                    None => "n/a".to_string(),
+                },
                 self.total_token_count
             )
         }
